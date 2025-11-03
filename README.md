@@ -29,7 +29,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-streamlit run app.py
+streamlit run mags.py
 ```
 
 The app will open in your browser at `http://localhost:8501`
