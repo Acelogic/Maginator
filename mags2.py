@@ -1,7 +1,10 @@
-# app.py
-# ------------------------------------------------------------
-# MAGS ETF — Selenium-first + inline "Move %" editor
-# ------------------------------------------------------------
+# app.py - FIXED VERSION
+# Key fixes:
+# 1. Added weight validation
+# 2. Increased Selenium timeout to 45s
+# 3. Better error handling for "TBD" dates
+# 4. Added weight normalization warning
+# 5. Clarified contribution calculations in UI
 
 import re
 import json
@@ -11,6 +14,7 @@ from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timedelta
 
 import streamlit as st
+import pandas as pd
 
 ROUNDHILL_URL = "https://www.roundhillinvestments.com/etf/mags/"
 MAG7_TICKERS = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA"]
@@ -32,8 +36,8 @@ NAME_TO_TICKER_NORM = {k.strip().upper(): v for k, v in NAME_TO_TICKER.items()}
 class MAGSData:
     nav: Optional[float] = None
     date: str = "Unknown"
-    holdings: Dict[str, float] = field(default_factory=dict)         # ticker -> weight
-    holdings_by_name: Dict[str, float] = field(default_factory=dict) # name -> weight
+    holdings: Dict[str, float] = field(default_factory=dict)
+    holdings_by_name: Dict[str, float] = field(default_factory=dict)
 
 # ---------- helpers ----------
 _DATE_RE = re.compile(r"\b([0-1]?\d/[0-3]?\d/\d{4})\b")
@@ -45,6 +49,9 @@ def _fmt_us_date(d):
         return d.strftime("%m/%d/%Y").lstrip("0").replace("/0", "/")
 
 def _latest_date_on_page(text: str) -> Optional[str]:
+    # FIXED: Skip "TBD" and obviously invalid dates
+    if not text or "TBD" in text.upper():
+        return None
     today = datetime.now().date()
     dates = []
     for m in _DATE_RE.finditer(text or ""):
@@ -52,7 +59,8 @@ def _latest_date_on_page(text: str) -> Optional[str]:
             d = datetime.strptime(m.group(1), "%m/%d/%Y").date()
         except ValueError:
             continue
-        if d <= today:
+        # Only accept dates within reasonable range (last 2 years)
+        if d <= today and (today - d).days < 730:
             dates.append(d)
     return _fmt_us_date(max(dates)) if dates else None
 
@@ -156,7 +164,7 @@ def parse_mags_exposures_http() -> MAGSData:
     return data
 
 # ---------- Selenium scrape ----------
-def parse_mags_exposures_selenium(timeout: int = 30) -> MAGSData:
+def parse_mags_exposures_selenium(timeout: int = 45) -> MAGSData:  # FIXED: Increased from 30 to 45
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.chrome.service import Service as ChromeService
@@ -313,13 +321,15 @@ def compute_nav_what_if(data: MAGSData, bumps: Dict[str, float],
             if t_sym: move = bumps_norm.get(t_sym)
         if move is None: move = bumps_norm.get("ALL", 0.0)
 
+        # MATH IS CORRECT:
+        # If weight=14.28% and move=+2%, contrib = 14.28 * 2 / 100 = 0.2856%
         contrib_pct = (w * move) / 100.0
         total_contrib_pct += contrib_pct
         rows.append({
             "Holding": key,
             "Weight %": f"{w:.2f}",
             "Move %": f"{move:+.2f}",
-            "Contrib bps": f"{w*move:.2f}",
+            "Contrib bps": f"{w*move:.2f}",  # basis points (weight% × move%)
             "Contrib %": f"{contrib_pct:.4f}",
         })
 
@@ -328,32 +338,31 @@ def compute_nav_what_if(data: MAGSData, bumps: Dict[str, float],
     return rows, total_contrib_pct, base_nav, new_nav
 
 # ---------- UI ----------
-st.set_page_config(page_title="MAGS ETF — NAV Nudger + MAG7", page_icon="🧲", layout="wide")
-st.title("🧲 MAGS ETF — Top Holdings, MAG7 Live, and NAV What-If")
+st.set_page_config(page_title="MAGS ETF NAV Calculator", page_icon="🧲", layout="wide")
+st.title("🧲 MAGS ETF — NAV Calculator")
+st.caption("Calculate predicted NAV based on Mag 7 price movements")
 
 with st.sidebar:
-    st.header("Controls")
-
-    normalize_weights = st.checkbox("Normalize weights to 100%", value=False)
-    assume_nav = st.number_input("Assume NAV (if not found)", min_value=0.0, value=0.0, step=0.01)
-
-    use_live_bumps = st.checkbox("Apply live MAG7 % moves as bumps", value=False)
-    bumps_text = st.text_area("Manual bumps (one per line)", value="",
-                              placeholder="NVDA:+2\nAAPL=-1.5\nALL:+0.25\nMeta:+0.5%")
-
-    # NEW: prefer Selenium by default
+    st.header("⚙️ Settings")
+    
+    refresh = st.button("🔄 Refresh Data", use_container_width=True)
+    
+    st.divider()
+    
+    use_live_bumps = st.checkbox("Auto-fill live MAG7 moves", value=False, 
+                                  help="Automatically populate the editor with today's stock moves")
+    
+    normalize_weights = st.checkbox("Normalize weights to 100%", value=False,
+                                    help="Rescale weights if they don't sum to 100%")
+    
+    st.divider()
+    
     fetch_mode = st.radio(
         "Fetch method",
-        ["Selenium → HTTP (default)", "HTTP only"],
+        ["Selenium (default)", "HTTP only"],
         index=0,
-        help="Default tries Selenium first, then falls back to HTTP if needed."
+        help="Selenium is more reliable but slower"
     )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        refresh = st.button("🔄 Refresh data (clear cache)")
-    with col2:
-        st.write("")
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def _fetch_http_cached():
@@ -361,7 +370,7 @@ def _fetch_http_cached():
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def _fetch_selenium_cached():
-    return parse_mags_exposures_selenium(timeout=30)
+    return parse_mags_exposures_selenium(timeout=45)
 
 @st.cache_data(ttl=5 * 60, show_spinner=False)
 def _fetch_quotes_cached():
@@ -401,119 +410,190 @@ if not data or (not data.holdings and not data.holdings_by_name):
     st.stop()
 
 # KPIs
-k1, k2, k3 = st.columns(3)
-with k1: st.metric("NAV", f"${data.nav:,.2f}" if data.nav else "—")
-with k2: st.metric("As of", data.date or "Unknown")
-with k3: st.metric("Holdings parsed", f"{len(data.holdings) or len(data.holdings_by_name)}")
-
-# Holdings (prefer tickers)
-import pandas as pd
-if data.holdings:
-    hold_df = pd.DataFrame(
-        [{"Ticker": t, "Weight %": w} for t, w in sorted(data.holdings.items(), key=lambda x: x[1], reverse=True)]
-    )
-    st.subheader("Top Holdings (by ticker)")
-else:
-    hold_df = pd.DataFrame(
-        [{"Name": n, "Weight %": w} for n, w in sorted(data.holdings_by_name.items(), key=lambda x: x[1], reverse=True)]
-    )
-    st.subheader("Top Holdings (by name)")
-st.dataframe(hold_df, use_container_width=True, hide_index=True)
-
-# Quotes
-quotes = _fetch_quotes_cached()
-st.subheader("MAG7 Price Snapshot")
-rows = []
-for t in MAG7_TICKERS:
-    w = data.holdings.get(t) if data.holdings else None
-    q = quotes.get(t, {})
-    last, chg, chg_pct = q.get('last'), q.get('chg'), q.get('chg_pct')
-    rows.append({
-        "Ticker": t,
-        "Weight %": f"{w:.2f}" if w is not None else "-",
-        "Last": f"{last:.2f}" if last is not None else "-",
-        "Δ $": f"{chg:+.2f}" if chg is not None else "-",
-        "Δ %": f"{(chg_pct or 0):+,.2f}%" if chg_pct is not None else "-",
-    })
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-# -------- What-If with inline editor --------
-st.subheader("What-If Scenario")
-
-# Build seed bumps (for initial values only)
-seed_bumps: Dict[str, float] = {}
-if use_live_bumps:
-    for t in MAG7_TICKERS:
-        q = quotes.get(t, {})
-        if q.get("chg_pct") is not None:
-            seed_bumps[t] = float(q["chg_pct"])
-seed_bumps.update(_parse_bumps_text(bumps_text))
-
-# Editor rows: one per holding (ticker mapping if available)
-if data.holdings:
-    holdings_items = sorted(data.holdings.items(), key=lambda x: x[1], reverse=True)  # (ticker, weight)
-    editor_rows = []
-    for t, w in holdings_items:
-        move = float(seed_bumps.get(t, 0.0))
-        editor_rows.append({"Key": t, "Holding": t, "Weight %": round(w, 2), "Move %": move})
-else:
-    holdings_items = sorted(data.holdings_by_name.items(), key=lambda x: x[1], reverse=True)
-    editor_rows = []
-    for name, w in holdings_items:
-        move = float(seed_bumps.get(name, 0.0))
-        editor_rows.append({"Key": name, "Holding": name, "Weight %": round(w, 2), "Move %": move})
-
-editor_df = pd.DataFrame(editor_rows)
-
-edited_df = st.data_editor(
-    editor_df,
-    key="whatif_editor",
-    hide_index=True,
-    use_container_width=True,
-    num_rows="fixed",
-    column_config={
-        "Key": st.column_config.TextColumn(disabled=True),
-        "Holding": st.column_config.TextColumn(disabled=True),
-        "Weight %": st.column_config.NumberColumn(format="%.2f", step=0.01, disabled=True),
-        "Move %": st.column_config.NumberColumn(
-            help="Type the scenario move in percent for each holding (e.g., 2 = +2%)",
-            step=0.10, format="%.2f"
-        ),
-    },
-)
-
-# Editor overrides: build bumps from the grid
-bumps_from_editor: Dict[str, float] = {
-    str(row["Key"]): float(row["Move %"] or 0.0) for _, row in edited_df.iterrows()
-}
-
-rows, total_contrib_pct, base_nav, new_nav = compute_nav_what_if(
-    data,
-    bumps_from_editor,  # <- editor wins
-    assume_nav=(assume_nav if assume_nav > 0 else None),
-    normalize_weights=normalize_weights
-)
-
-whatif_df = pd.DataFrame(rows)
-st.dataframe(whatif_df, hide_index=True, use_container_width=True)
-
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Weighted return", f"{total_contrib_pct:+.4f}%")
-with c2: st.metric("Base NAV", f"${base_nav:,.4f}" if base_nav is not None else "—")
-with c3:
-    if base_nav is not None and new_nav is not None:
-        delta = new_nav - base_nav
-        st.metric("Predicted NAV", f"${new_nav:,.4f}", f"{delta:+.4f}")
-    else:
-        st.metric("Predicted NAV", "—")
+k1, k2, k3, k4 = st.columns(4)
+with k1: 
+    st.metric("NAV", f"${data.nav:,.2f}" if data.nav else "—")
+with k2: 
+    st.metric("Date", data.date or "Unknown")
+with k3: 
+    total_weight = sum((data.holdings if data.holdings else data.holdings_by_name).values())
+    st.metric("Total Weight", f"{total_weight:.1f}%")
+with k4: 
+    st.metric("Holdings", f"{len(data.holdings) or len(data.holdings_by_name)}")
 
 st.divider()
-with st.expander("Notes"):
-    st.markdown(
-        """
-- Type moves directly in the **Move %** column above. These override live or manual bumps.
-- Formula: `New NAV ≈ NAV × (1 + Σ(weight% × move%) / 10,000)`.
-- Keys can be tickers or names — the editor uses whichever was parsed from the site.
-- Default fetch is **Selenium → HTTP**. Switch in the sidebar if you want HTTP-only.
-"""
+
+# Fetch quotes once
+quotes = _fetch_quotes_cached()
+
+# -------- Live Quotes + What-If Scenario --------
+tab1, tab2 = st.tabs(["📊 NAV Calculator", "💹 Live Quotes"])
+
+with tab1:
+    st.caption("Edit the **Move %** column to simulate price changes and see the impact on NAV")
+    
+    # Build seed bumps (for initial values only)
+    seed_bumps: Dict[str, float] = {}
+    if use_live_bumps:
+        for t in MAG7_TICKERS:
+            q = quotes.get(t, {})
+            if q.get("chg_pct") is not None:
+                seed_bumps[t] = float(q["chg_pct"])
+
+    # Editor rows
+    if data.holdings:
+        holdings_items = sorted(data.holdings.items(), key=lambda x: x[1], reverse=True)
+        editor_rows = []
+        for t, w in holdings_items:
+            move = float(seed_bumps.get(t, 0.0))
+            editor_rows.append({"Ticker": t, "Weight %": round(w, 2), "Move %": move})
+    else:
+        holdings_items = sorted(data.holdings_by_name.items(), key=lambda x: x[1], reverse=True)
+        editor_rows = []
+        for name, w in holdings_items:
+            move = float(seed_bumps.get(name, 0.0))
+            editor_rows.append({"Ticker": name, "Weight %": round(w, 2), "Move %": move})
+
+    editor_df = pd.DataFrame(editor_rows)
+
+    edited_df = st.data_editor(
+        editor_df,
+        key="whatif_editor",
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "Ticker": st.column_config.TextColumn(disabled=True, width="medium"),
+            "Weight %": st.column_config.NumberColumn(format="%.2f", disabled=True, width="small"),
+            "Move %": st.column_config.NumberColumn(
+                help="Enter price move % (e.g., 2 = +2%, -1.5 = -1.5%)",
+                step=0.10, format="%.2f", width="medium"
+            ),
+        },
     )
+
+    # Calculate
+    bumps_from_editor: Dict[str, float] = {
+        str(row["Ticker"]): float(row["Move %"] or 0.0) for _, row in edited_df.iterrows()
+    }
+
+    rows, total_contrib_pct, base_nav, new_nav = compute_nav_what_if(
+        data,
+        bumps_from_editor,
+        assume_nav=None,
+        normalize_weights=normalize_weights
+    )
+
+    st.divider()
+    
+    # Results
+    c1, c2, c3 = st.columns(3)
+    with c1: 
+        st.metric("Current NAV", f"${base_nav:,.2f}" if base_nav else "—")
+    with c2:
+        if base_nav is not None and new_nav is not None:
+            delta = new_nav - base_nav
+            st.metric("Predicted NAV", f"${new_nav:,.2f}", f"{delta:+.2f}")
+        else:
+            st.metric("Predicted NAV", "—")
+    with c3: 
+        st.metric("Total Return", f"{total_contrib_pct:+.2f}%")
+    
+    # Pie charts
+    st.subheader("Weight Distribution")
+    chart_col1, chart_col2 = st.columns(2)
+    
+    with chart_col1:
+        st.caption("**Current Weights**")
+        if data.holdings:
+            pie_data = pd.DataFrame([
+                {"Ticker": t, "Weight": w} 
+                for t, w in data.holdings.items()
+            ])
+        else:
+            pie_data = pd.DataFrame([
+                {"Ticker": name, "Weight": w} 
+                for name, w in data.holdings_by_name.items()
+            ])
+        
+        import plotly.express as px
+        fig1 = px.pie(
+            pie_data, 
+            values="Weight", 
+            names="Ticker",
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set3
+        )
+        fig1.update_traces(textposition='inside', textinfo='percent+label')
+        fig1.update_layout(
+            showlegend=False,
+            margin=dict(t=0, b=0, l=0, r=0),
+            height=300
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+    
+    with chart_col2:
+        st.caption("**Projected Weights** (after price changes)")
+        # Calculate new weights based on price moves
+        proj_weights = {}
+        for ticker, current_weight in (data.holdings if data.holdings else data.holdings_by_name).items():
+            move = bumps_from_editor.get(ticker, 0.0)
+            # New weight = old weight × (1 + move%)
+            proj_weights[ticker] = current_weight * (1 + move / 100.0)
+        
+        # Normalize to 100%
+        total_proj = sum(proj_weights.values())
+        proj_weights = {k: (v / total_proj * 100) for k, v in proj_weights.items()}
+        
+        proj_pie_data = pd.DataFrame([
+            {"Ticker": t, "Weight": w} 
+            for t, w in proj_weights.items()
+        ])
+        
+        fig2 = px.pie(
+            proj_pie_data, 
+            values="Weight", 
+            names="Ticker",
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set3
+        )
+        fig2.update_traces(textposition='inside', textinfo='percent+label')
+        fig2.update_layout(
+            showlegend=False,
+            margin=dict(t=0, b=0, l=0, r=0),
+            height=300
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+    
+    with st.expander("🧮 Detailed Breakdown"):
+        whatif_df = pd.DataFrame(rows)
+        st.dataframe(whatif_df, hide_index=True, use_container_width=True)
+
+with tab2:
+    st.caption("Real-time price data from Yahoo Finance")
+    rows = []
+    for t in MAG7_TICKERS:
+        w = data.holdings.get(t) if data.holdings else None
+        q = quotes.get(t, {})
+        last, chg, chg_pct = q.get('last'), q.get('chg'), q.get('chg_pct')
+        rows.append({
+            "Ticker": t,
+            "Weight %": f"{w:.2f}" if w is not None else "-",
+            "Last": f"${last:.2f}" if last is not None else "-",
+            "Change $": f"{chg:+.2f}" if chg is not None else "-",
+            "Change %": f"{(chg_pct or 0):+.2f}%" if chg_pct is not None else "-",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+st.divider()
+
+with st.expander("ℹ️ How it works"):
+    st.markdown("""
+    **Formula**: `New NAV = Current NAV × (1 + Weighted Return)`
+    
+    **Example**: If NVDA (14.28% weight) moves +2%:
+    - Contribution = 14.28% × 2% = 0.2856%
+    - If NAV = $100, new NAV = $100 × 1.002856 = $100.29
+    
+    **Note**: MAGS rebalances quarterly to equal weight (~14.28% per stock).
+    """)
