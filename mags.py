@@ -115,6 +115,172 @@ def _parse_bumps_text(block: str) -> Dict[str, float]:
             out[k] = v
     return out
 
+# ---------- StockAnalysis.com scraper (best for cloud) ----------
+def parse_mags_from_stockanalysis() -> MAGSData:
+    """Fetch MAGS data from StockAnalysis.com - clean HTML, works everywhere"""
+    import requests
+    from bs4 import BeautifulSoup
+    
+    headers = {
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    }
+    
+    # Get holdings
+    url = "https://stockanalysis.com/etf/mags/holdings/"
+    r = requests.get(url, headers=headers, timeout=12)
+    r.raise_for_status()
+    
+    soup = BeautifulSoup(r.text, "lxml")
+    data = MAGSData()
+    
+    # Parse holdings table
+    table = soup.find("table")
+    if not table:
+        raise Exception("Holdings table not found")
+    
+    rows = table.find_all("tr")[1:]  # Skip header
+    mag7_holdings = {}  # Accumulated holdings per ticker
+    
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) >= 4:
+            symbol = cells[1].get_text(strip=True)
+            name = cells[2].get_text(strip=True).upper()
+            weight_text = cells[3].get_text(strip=True)
+            
+            # Skip treasury bills and cash
+            if any(x in name for x in ["TREASURY", "BILL", "CASH", "FUND"]):
+                continue
+            
+            weight = _coerce_percent_to_float(weight_text)
+            if not weight:
+                continue
+            
+            # Match to MAG7 ticker (handle both direct and swap positions)
+            matched_ticker = None
+            
+            # Direct ticker match
+            if symbol in MAG7_TICKERS:
+                matched_ticker = symbol
+            # Swap detection - look for company name in the swap name
+            elif "SWAP" in name:
+                if "NVDA" in name or "NVIDIA" in name:
+                    matched_ticker = "NVDA"
+                elif "GOOGL" in name or "ALPHABET" in name:
+                    matched_ticker = "GOOGL"
+                elif "AMZN" in name or "AMAZON" in name:
+                    matched_ticker = "AMZN"
+                elif "TSLA" in name or "TESLA" in name:
+                    matched_ticker = "TSLA"
+                elif "AAPL" in name or "APPLE" in name:
+                    matched_ticker = "AAPL"
+                elif "MSFT" in name or "MICROSOFT" in name:
+                    matched_ticker = "MSFT"
+                elif "META" in name:
+                    matched_ticker = "META"
+            
+            # Accumulate weight for this ticker
+            if matched_ticker:
+                if matched_ticker not in mag7_holdings:
+                    mag7_holdings[matched_ticker] = 0.0
+                mag7_holdings[matched_ticker] += weight
+    
+    # No need to normalize - swaps already give us the total exposure
+    if not mag7_holdings:
+        raise Exception("No MAG7 holdings found")
+    
+    for symbol, total_weight in mag7_holdings.items():
+        data.holdings[symbol] = total_weight
+        
+        # Map to name for holdings_by_name
+        name_map = {
+            "NVDA": "NVIDIA",
+            "AAPL": "Apple",
+            "MSFT": "Microsoft",
+            "GOOGL": "Alphabet",
+            "AMZN": "AMAZON.COM INC",
+            "META": "Meta Platforms",
+            "TSLA": "Tesla"
+        }
+        data.holdings_by_name[name_map.get(symbol, symbol)] = total_weight
+    
+    # Get NAV from StockAnalysis main page
+    try:
+        main_url = "https://stockanalysis.com/etf/mags/"
+        r2 = requests.get(main_url, headers=headers, timeout=12)
+        r2.raise_for_status()
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        
+        # Look for the price in the specific div element
+        # <div class="text-4xl font-bold transition-colors duration-300 block sm:inline">67.96</div>
+        price_div = soup2.find("div", class_=lambda x: x and "text-4xl" in x and "font-bold" in x)
+        if price_div:
+            price_text = price_div.get_text(strip=True)
+            data.nav = float(price_text.replace(",", ""))
+    except Exception:
+        pass
+    
+    data.date = _last_weekday_str()
+    return data
+
+# ---------- Yahoo Finance Holdings (Streamlit Cloud compatible) ----------
+def parse_mags_from_yfinance() -> MAGSData:
+    """Fetch MAGS data from Yahoo Finance - works on Streamlit Cloud"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise Exception("yfinance not installed")
+    
+    data = MAGSData()
+    
+    try:
+        ticker = yf.Ticker("MAGS")
+        
+        # Get NAV
+        info = ticker.info or {}
+        data.nav = info.get("navPrice") or info.get("previousClose")
+        
+        # Get holdings from fund_holding_info
+        holdings_info = getattr(ticker, "fund_holding_info", None)
+        if holdings_info is not None and hasattr(holdings_info, "to_dict"):
+            holdings_dict = holdings_info.to_dict()
+            if "holdings" in holdings_dict:
+                for holding in holdings_dict["holdings"]:
+                    symbol = holding.get("symbol", "")
+                    weight = holding.get("holdingPercent")
+                    if symbol and weight:
+                        weight_pct = weight * 100  # Convert decimal to percent
+                        data.holdings[symbol] = weight_pct
+                        # Also add by name
+                        name = holding.get("holdingName", symbol)
+                        data.holdings_by_name[name] = weight_pct
+        
+        # Fallback: try get_holdings() method
+        if not data.holdings:
+            try:
+                holdings_df = ticker.get_holdings()
+                if holdings_df is not None and not holdings_df.empty:
+                    for _, row in holdings_df.iterrows():
+                        symbol = row.get("Symbol", row.get("Ticker", ""))
+                        weight = row.get("% of Net Assets", row.get("Weight", 0))
+                        if symbol and weight:
+                            # Handle if weight is already percentage or decimal
+                            weight_val = float(weight)
+                            if weight_val < 1:  # Likely decimal format
+                                weight_val *= 100
+                            data.holdings[symbol] = weight_val
+            except Exception:
+                pass
+        
+        # Get date
+        data.date = _last_weekday_str()
+        
+    except Exception as e:
+        raise Exception(f"Yahoo Finance error: {e}")
+    
+    return data
+
 # ---------- HTTP scrape ----------
 def parse_mags_exposures_http() -> MAGSData:
     import requests
@@ -349,20 +515,31 @@ with st.sidebar:
     
     st.divider()
     
+    manual_nav = st.number_input("Manual NAV (optional)", min_value=0.0, value=0.0, step=0.01,
+                                 help="Override NAV if auto-fetch fails. Leave at 0 to use auto-fetched value.")
+    
     use_live_bumps = st.checkbox("Auto-fill live MAG7 moves", value=False, 
                                   help="Automatically populate the editor with today's stock moves")
     
-    normalize_weights = st.checkbox("Normalize weights to 100%", value=False,
-                                    help="Rescale weights if they don't sum to 100%")
+    normalize_weights = st.checkbox("Force equal weight (14.28% each)", value=False,
+                                    help="Override actual weights and use equal 14.28% for all stocks")
     
     st.divider()
     
     fetch_mode = st.radio(
         "Fetch method",
-        ["Selenium (default)", "HTTP only"],
+        ["StockAnalysis.com (best)", "Yahoo Finance", "Selenium (local only)", "HTTP (Roundhill direct)"],
         index=0,
-        help="Selenium is more reliable but slower"
+        help="StockAnalysis.com has clean data and works on Streamlit Cloud"
     )
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def _fetch_stockanalysis_cached():
+    return parse_mags_from_stockanalysis()
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def _fetch_yfinance_cached():
+    return parse_mags_from_yfinance()
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def _fetch_http_cached():
@@ -377,29 +554,57 @@ def _fetch_quotes_cached():
     return fetch_mag7_quotes()
 
 if refresh:
-    _fetch_http_cached.clear(); _fetch_selenium_cached.clear(); _fetch_quotes_cached.clear()
+    _fetch_stockanalysis_cached.clear(); _fetch_yfinance_cached.clear(); _fetch_http_cached.clear(); _fetch_selenium_cached.clear(); _fetch_quotes_cached.clear()
     st.toast("Cache cleared.", icon="🧹")
 
-# Fetch exposures (Selenium-first default)
+# Fetch exposures
 data = None
 errors = []
-if fetch_mode.startswith("Selenium"):
+
+if fetch_mode.startswith("StockAnalysis"):
+    try:
+        with st.spinner("Fetching MAGS holdings (StockAnalysis.com)…"):
+            data = _fetch_stockanalysis_cached()
+    except Exception as e:
+        errors.append(f"StockAnalysis error: {e}")
+        try:
+            with st.spinner("StockAnalysis failed — trying Yahoo Finance…"):
+                data = _fetch_yfinance_cached()
+        except Exception as e2:
+            errors.append(f"Yahoo fallback error: {e2}")
+elif fetch_mode.startswith("Yahoo"):
+    try:
+        with st.spinner("Fetching MAGS holdings (Yahoo Finance)…"):
+            data = _fetch_yfinance_cached()
+    except Exception as e:
+        errors.append(f"Yahoo Finance error: {e}")
+        try:
+            with st.spinner("Yahoo failed — trying StockAnalysis…"):
+                data = _fetch_stockanalysis_cached()
+        except Exception as e2:
+            errors.append(f"StockAnalysis fallback error: {e2}")
+elif fetch_mode.startswith("Selenium"):
     try:
         with st.spinner("Fetching MAGS holdings (Selenium)…"):
             data = _fetch_selenium_cached()
     except Exception as e:
         errors.append(f"Selenium error: {e}")
         try:
-            with st.spinner("Selenium failed — falling back to HTTP…"):
-                data = _fetch_http_cached()
+            with st.spinner("Selenium failed — falling back to StockAnalysis…"):
+                data = _fetch_stockanalysis_cached()
         except Exception as e2:
-            errors.append(f"HTTP fallback error: {e2}")
-else:
+            errors.append(f"StockAnalysis fallback error: {e2}")
+else:  # HTTP (Roundhill direct)
     try:
-        with st.spinner("Fetching MAGS holdings (HTTP)…"):
+        with st.spinner("Fetching MAGS holdings (Roundhill HTTP)…"):
             data = _fetch_http_cached()
     except Exception as e:
         errors.append(f"HTTP error: {e}")
+        try:
+            with st.spinner("HTTP failed — trying StockAnalysis…"):
+                data = _fetch_stockanalysis_cached()
+        except Exception as e2:
+            errors.append(f"StockAnalysis fallback error: {e2}")
 
 if not data or (not data.holdings and not data.holdings_by_name):
     st.error("Could not fetch MAGS data.")
@@ -409,16 +614,24 @@ if not data or (not data.holdings and not data.holdings_by_name):
                 st.code(err)
     st.stop()
 
+if not data.nav:
+    st.warning("⚠️ NAV not found. Try refreshing or enter manually in sidebar.")
+    if fetch_mode.startswith("StockAnalysis"):
+        with st.expander("NAV Debug Info"):
+            st.write("Failed to parse NAV from StockAnalysis. Looking for div with class 'text-4xl font-bold'")
+            st.write("Try manual NAV entry in sidebar.")
+
+# Apply manual NAV override if set
+if manual_nav > 0:
+    data.nav = manual_nav
+
 # KPIs
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3 = st.columns(3)
 with k1: 
     st.metric("NAV", f"${data.nav:,.2f}" if data.nav else "—")
 with k2: 
     st.metric("Date", data.date or "Unknown")
 with k3: 
-    total_weight = sum((data.holdings if data.holdings else data.holdings_by_name).values())
-    st.metric("Total Weight", f"{total_weight:.1f}%")
-with k4: 
     st.metric("Holdings", f"{len(data.holdings) or len(data.holdings_by_name)}")
 
 st.divider()
@@ -530,7 +743,7 @@ with tab1:
             margin=dict(t=0, b=0, l=0, r=0),
             height=300
         )
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, use_container_width=True, key="current_weights_pie")
     
     with chart_col2:
         st.caption("**Projected Weights** (after price changes)")
@@ -563,7 +776,7 @@ with tab1:
             margin=dict(t=0, b=0, l=0, r=0),
             height=300
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, key="projected_weights_pie")
     
     with st.expander("🧮 Detailed Breakdown"):
         whatif_df = pd.DataFrame(rows)
@@ -591,9 +804,14 @@ with st.expander("ℹ️ How it works"):
     st.markdown("""
     **Formula**: `New NAV = Current NAV × (1 + Weighted Return)`
     
-    **Example**: If NVDA (14.28% weight) moves +2%:
-    - Contribution = 14.28% × 2% = 0.2856%
-    - If NAV = $100, new NAV = $100 × 1.002856 = $100.29
+    **Example**: If NVDA (15.39% weight) moves +2%:
+    - Contribution = 15.39% × 2% = 0.3078%
+    - If NAV = $100, new NAV = $100 × 1.003078 = $100.31
     
-    **Note**: MAGS rebalances quarterly to equal weight (~14.28% per stock).
+    **About MAGS Weights**: 
+    - MAGS uses **stock + swap positions** to get exposure to each company
+    - Total portfolio: ~55% MAG7 stocks/swaps + ~45% cash/T-bills
+    - Weights shown are **total exposure** (stock + swaps combined) matching Roundhill's display
+    - Uses swaps to maintain RIC diversification compliance for tax purposes
+    - Rebalances quarterly to maintain roughly equal weight among the 7 stocks
     """)
